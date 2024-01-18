@@ -38,22 +38,27 @@ using namespace std;
 
 
 struct params_t {
+  const char* skip_buckets    = nullptr;
+  const char* allowed_buckets = nullptr;
   //const char* endpoint   = "http://127.0.0.1:5000"; // RGW Balancer port
   const char* endpoint   = "http://127.0.0.1:8000"; // RGW default port
   const char* access_key = nullptr;
   const char* secret_key = nullptr;
   int threads_count = 4;
-  int sample_rate   = 1;
 };
 
 std::ostream &operator<<(std::ostream &stream, const params_t & p)
 {
+  if (p.skip_buckets) {
+    stream << "skip_buckets_file=" << p.skip_buckets << std::endl;
+  }
+  if (p.allowed_buckets) {
+    stream << "allowed_buckets_file=" << p.allowed_buckets << std::endl;
+  }
   stream << "endpoint=" << p.endpoint << std::endl;
   stream << "access_key=" << ((p.access_key == nullptr) ? "default" : p.access_key) << std::endl;
   stream << "secret_key=" << ((p.secret_key == nullptr) ? "default" : p.secret_key) << std::endl;
   stream << "threads_count=" << p.threads_count << std::endl;
-  stream << "sample_rate=1/" << p.sample_rate
-	 << " (we will sample 1 out of every "<< p.sample_rate << " objcets)" << std::endl;
   return stream;
 }
 
@@ -102,8 +107,6 @@ using MD5_Dict = std::unordered_map<struct Key, uint32_t, KeyHash, KeyEqual>;
 
 std::mutex dict_mtx;
 std::mutex print_mtx;
-unsigned sample_rate = 1;	// sample 1 of the objects
-//unsigned sample_rate = 10;	// sample 1/10 of the objects
 
 //==========================================================================
 struct arr_entry {
@@ -249,11 +252,9 @@ static void print_report(const MD5_Dict &etags_dict)
     }
   }
 
-  std::cout << "We had " << multipart_obj_count * sample_rate << " multipart objects out of "
-	    << (multipart_obj_count + single_part_obj_count)*sample_rate << std::endl;
+  std::cout << "We had " << multipart_obj_count  << " multipart objects out of "
+	    << (multipart_obj_count + single_part_obj_count) << std::endl;
 
-  duplicated_data_kb *= sample_rate;
-  unique_data_kb     *= sample_rate;
   uint64_t total_size_kb = duplicated_data_kb + unique_data_kb;
   std::cout << "We had a total of " << total_size_kb << " KiB stored in the system\n";
   std::cout << "We had " << unique_data_kb << " Unique Data KiB stored in the system\n";
@@ -395,7 +396,7 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
 
     char buff[64];
     for (Aws::S3::Model::Object &object: objects) {
-      if (rand() % sample_rate == 0) {
+      if (rand() == 0) {
 	objs_cnt ++;
 	const auto   & etag      = object.GetETag();
 	const uint32_t size      = div_up(object.GetSize(), 1024); // KB
@@ -480,6 +481,68 @@ bool ListObjects(const Aws::Client::ClientConfiguration &clientConfig,
 }
 
 //---------------------------------------------------------------------------
+static int read_bucket_names_from_file(const char *filename, std::set<std::string> *buckets)
+{
+  std::ifstream ifs;
+  ifs.open(filename, std::ifstream::in);
+  if (ifs.fail()) {
+    std::cerr << "Failed to open file " << filename << std::endl;
+    return -1;
+  }
+
+  std::string line;
+  while (std::getline(ifs, line)) {
+    buckets->insert(line);
+  }
+  return 0;
+}
+
+//---------------------------------------------------------------------------
+static int filter_buckets_list(std::vector<std::string> &bucket_names, const struct params_t *params)
+{
+  std::set<std::string> skip_buckets;
+  std::set<std::string> allowed_buckets;
+
+  if (!params->skip_buckets && !params->allowed_buckets) {
+    // nothing to do
+    return 0;
+  }
+
+  if (params->skip_buckets) {
+    if (read_bucket_names_from_file(params->skip_buckets, &skip_buckets) != 0) {
+      return -1;
+    }
+  }
+  if (params->allowed_buckets) {
+    if (read_bucket_names_from_file(params->allowed_buckets, &allowed_buckets) != 0) {
+      return -1;
+    }
+  }
+
+  if ((skip_buckets.size() > 0) || (allowed_buckets.size() > 0)) {
+    std::sort(bucket_names.begin(), bucket_names.end());
+
+    if (allowed_buckets.size() > 0) {
+      std::vector<std::string> intersection;
+      std::set_intersection(bucket_names.begin(), bucket_names.end(),
+			    allowed_buckets.begin(), allowed_buckets.end(),
+			    std::back_inserter(intersection));
+      bucket_names.swap(intersection);
+    }
+
+    if (skip_buckets.size() > 0) {
+      std::vector<std::string> diff;
+      std::set_difference(bucket_names.begin(), bucket_names.end(),
+			  skip_buckets.begin(), skip_buckets.end(),
+			  std::inserter(diff, diff.begin()));
+      bucket_names.swap(diff);
+    }
+  }
+
+  return 0;
+}
+
+//---------------------------------------------------------------------------
 static bool argv_name_is(const char **argv, unsigned idx, const char *name)
 {
   return(strncmp(argv[idx], name, strlen(name)) == 0);
@@ -546,8 +609,10 @@ int usage(const char **argv)
 {
   std::cerr << "\nusage: " << argv[0] << " [options] \n"
     "options:\n"
-    "   --sample-rate=rate\n"
-    "        set the sampling rate (default sample 1/1)\n"
+    "   --skip_buckets=skip-buckets-filename\n"
+    "        pass in a filename containing list of bucket names to skip\n"
+    "   --allowed_buckets=allowed-buckets-filename\n"
+    "        pass in a filename containing list of all allowed bucket names to process\n"
     "   --thread-count=count\n"
     "        set the number of threads to run (default 4 threads)\n"
     "   --endpoint=url:port\n"
@@ -556,15 +621,14 @@ int usage(const char **argv)
     "        set the access key to the S3 GW (default empty - take key from configuration)\n"
     "   --secret-key=key\n"
     "        set the secret key to the S3 GW (default empty - take key from configuration)\n"
-       << std::endl;
+	    << std::endl;
   return -1;
 }
 
 //---------------------------------------------------------------------------
-int check_argv(int argc, const char **argv, struct params_t *params)
+static int check_argv(int argc, const char **argv, struct params_t *params)
 {
   constexpr unsigned THREAD_COUNT_MAX = 32; // no more than 32 threads
-  constexpr unsigned SAMPLE_RATE_MAX  = 40; // sample no less than 1/40
 
   for (int i = 1; i < argc; i++) {
     if (argv_name_is(argv, i, "--help")) {
@@ -576,9 +640,15 @@ int check_argv(int argc, const char **argv, struct params_t *params)
 	return -1;
       }
     }
-    else if (argv_name_is(argv, i, "--sample-rate")) {
-      params->sample_rate = get_argv_val(argv, i, SAMPLE_RATE_MAX);
-      if (params->sample_rate <= 0) {
+    else if (argv_name_is(argv, i, "--skip_buckets")) {
+      params->skip_buckets = get_argv_string(argv, i);
+      if (params->skip_buckets == nullptr) {
+	return -1;
+      }
+    }
+    else if (argv_name_is(argv, i, "--allowed_buckets")) {
+      params->allowed_buckets = get_argv_string(argv, i);
+      if (params->allowed_buckets == nullptr) {
 	return -1;
       }
     }
@@ -614,6 +684,7 @@ int main(int argc, const char **argv)
 {
   struct params_t params;
   if (check_argv(argc, argv, &params) != 0) {
+    std::cerr << "failed check_argv" << std::endl;
     return usage(argv);
   }
   cout << params << std::endl;
@@ -651,13 +722,17 @@ int main(int argc, const char **argv)
     num_buckets = reply.GetResult().GetBuckets().size();
 
     for (auto &bucket: reply.GetResult().GetBuckets()) {
-      std::cout << "bucket = " << bucket.GetName() << std::endl;
+      //std::cout << "bucket = " << bucket.GetName() << std::endl;
       bucket_names.emplace_back(bucket.GetName());
     }
   }
   else {
     Aws::ShutdownAPI(options); // Should only be called once.
     return -1;
+  }
+
+  if (filter_buckets_list(bucket_names, &params) != 0) {
+    return usage(argv);
   }
 
   unsigned max_thread = std::min(thread_count, num_buckets);
@@ -680,8 +755,8 @@ int main(int argc, const char **argv)
     uniq_cnt += uniq_cnt_arr[id];
   }
   std::cout << "===========================================================================\n" << std::endl;
-  std::cout << "bucket count: " << num_buckets << ", total objects: " << objs_cnt * sample_rate << std::endl;
-  std::cout << "We had " << uniq_cnt *sample_rate << " unique keys from a total of " << objs_cnt *sample_rate << " keys" << std::endl;
+  std::cout << "bucket count: " << num_buckets << ", total objects: " << objs_cnt << std::endl;
+  std::cout << "We had " << uniq_cnt << " unique keys from a total of " << objs_cnt << " keys" << std::endl;
   print_report(etags_dict);
 
   Aws::ShutdownAPI(options); // Should only be called once.
