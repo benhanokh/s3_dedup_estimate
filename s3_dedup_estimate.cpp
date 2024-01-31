@@ -396,7 +396,7 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
 
     char buff[64];
     for (Aws::S3::Model::Object &object: objects) {
-      if (rand() == 0) {
+      {
 	objs_cnt ++;
 	const auto   & etag      = object.GetETag();
 	const uint32_t size      = div_up(object.GetSize(), 1024); // KB
