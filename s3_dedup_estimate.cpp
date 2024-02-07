@@ -36,6 +36,11 @@ using namespace std;
 //Aws::Auth::AWSCredentials credentials("0555b35654ad1656d804", "h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q==");
 //Aws::Auth::AWSCredentials credentials("KF7KMXHXU9R2DHG1CKSL", "9gA16gTPyM2ZsBsGzDVkNsaiVH5egYBqFc9PAPLB");
 
+//---------------------------------------------------------------------------
+static inline uint64_t div_up(uint64_t n, uint32_t d) {
+  return ((n + d - 1) /d);
+}
+
 
 struct params_t {
   const char* skip_buckets    = nullptr;
@@ -68,14 +73,14 @@ struct Key
   friend std::ostream &operator<<(std::ostream &stream, const Key & k);
   uint64_t md5_high;   // High Bytes of the Object Data MD5
   uint64_t md5_low;    // Low  Bytes of the Object Data MD5
-  uint32_t obj_size;   // Object size in KB (AWS MAX-SIZE is 5GB)
+  uint32_t obj_size;   // Object size in 4KB units (AWS MAX-SIZE is 5GB)
   uint16_t num_parts;  // How many parts were used in multipart upload (AWS MAX-PART is 10,000)
   uint16_t pad16;      // Pad to get 8 Bytes alignment
 } __attribute__((__packed__));	// 24Bytes are 8Bytes aligned so should probably be packed already
 
 std::ostream &operator<<(std::ostream &stream, const Key & k)
 {
-  stream << std::hex << "0x" << k.md5_high << k.md5_low << "::" << std::dec << k.obj_size << "KiB::" << k.num_parts;
+  stream << std::hex << "0x" << k.md5_high << k.md5_low << "::" << std::dec << 4*k.obj_size << "KiB::" << k.num_parts;
   if (k.pad16) {
     stream << "PAD=" << k.pad16 << "\n";
   }
@@ -220,8 +225,10 @@ public:
 //---------------------------------------------------------------------------
 static void print_report(const MD5_Dict &etags_dict)
 {
-  uint64_t  duplicated_data_kb   = 0;
-  uint64_t  unique_data_kb       = 0;
+  // on disk allocation is done in 4KB units
+  uint64_t duplicated_data_units = 0;
+  uint64_t unique_data_units     = 0;
+
   uint64_t multipart_obj_count   = 0;
   uint64_t single_part_obj_count = 0;
 
@@ -241,25 +248,29 @@ static void print_report(const MD5_Dict &etags_dict)
       std::cerr << "Bad Key with zero parts! " << key << std::endl;
     }
 
-    unique_data_kb     += key.obj_size;
-    duplicated_data_kb += (count-1)*(key.obj_size);
+    unique_data_units     += key.obj_size;
+    duplicated_data_units += (count-1)*(key.obj_size);
 
+    // on disk allocation is done in 4KB units
     if (count < ARR_SIZE) {
-      summery[count].add_entry(key.obj_size);
+      summery[count].add_entry(key.obj_size * 4);
     }
     else {
-      summery[ARR_SIZE].add_entry(key.obj_size);
+      summery[ARR_SIZE].add_entry(key.obj_size * 4);
     }
   }
 
   std::cout << "We had " << multipart_obj_count  << " multipart objects out of "
 	    << (multipart_obj_count + single_part_obj_count) << std::endl;
 
+  // on disk allocation is done in 4KB units
+  uint64_t duplicated_data_kb = duplicated_data_units * 4;
+  uint64_t unique_data_kb = unique_data_units * 4;
   uint64_t total_size_kb = duplicated_data_kb + unique_data_kb;
   std::cout << "We had a total of " << total_size_kb << " KiB stored in the system\n";
   std::cout << "We had " << unique_data_kb << " Unique Data KiB stored in the system\n";
   std::cout << "We had " << duplicated_data_kb << " Duplicated KiB Bytes stored in the system\n";
-  std::cout << "Dedup Ratio = " << (float)total_size_kb/(float)unique_data_kb << std::endl;
+  std::cout << "Dedup Ratio = " << (double)total_size_kb/(double)unique_data_kb << std::endl;
   std::cout << "===========================================================================\n" << std::endl;
   for (unsigned idx = 0; idx < ARR_SIZE; idx ++) {
     if (summery[idx].get_count() > 0){
@@ -363,11 +374,6 @@ static uint16_t get_num_parts(const std::string & etag)
 }
 
 //---------------------------------------------------------------------------
-uint64_t div_up(uint64_t n, uint32_t d) {
-  return ((n + d - 1) /d);
-}
-
-//---------------------------------------------------------------------------
 bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
 				const std::string & bucket_name,
 				MD5_Dict *p_etags_dict,
@@ -399,7 +405,9 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
       {
 	objs_cnt ++;
 	const auto   & etag      = object.GetETag();
-	const uint32_t size      = div_up(object.GetSize(), 1024); // KB
+	// on disk allocation is done in 4KB units
+	// round up to find the on-disk space used by the object
+	const uint32_t size      = div_up(object.GetSize(), 4*1024);
 	const uint16_t num_parts = get_num_parts(etag);
 
 	const unsigned nbytes    = etag.copy(buff, 32, 1);
