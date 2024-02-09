@@ -260,6 +260,11 @@ static void print_report(const MD5_Dict &etags_dict)
     }
   }
 
+  if (unique_data_units == 0) {
+    std::cout << "We had a total of 0 KiB stored in the system" << std::endl;
+    return;
+  }
+
   std::cout << "We had " << multipart_obj_count  << " multipart objects out of "
 	    << (multipart_obj_count + single_part_obj_count) << std::endl;
 
