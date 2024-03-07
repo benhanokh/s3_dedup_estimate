@@ -6,8 +6,12 @@
 #include <aws/core/utils/HashingUtils.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/GetObjectResult.h>
+#include <aws/s3/model/GetBucketVersioningRequest.h>
+#include <aws/s3/model/ObjectVersion.h>
 #include <aws/s3/model/ListObjectsRequest.h>
 #include <aws/s3/model/ListObjectsResult.h>
+#include <aws/s3/model/ListObjectVersionsRequest.h>
+#include <aws/s3/model/ListObjectVersionsResult.h>
 
 #include <algorithm>
 #include <iostream>
@@ -41,6 +45,16 @@ static inline uint64_t div_up(uint64_t n, uint32_t d) {
   return ((n + d - 1) /d);
 }
 
+struct stat_counters_t {
+  // counter for the total existing objects
+  uint64_t objs_cnt = 0;
+  // counter for the unique copies of objects
+  uint64_t uniq_cnt = 0;
+  // counter for deleted copies of existing objects
+  uint64_t dels_cnt = 0;
+  // counter for old versions of existing objects
+  uint64_t vers_cnt = 0;
+};
 
 struct params_t {
   const char* skip_buckets    = nullptr;
@@ -382,8 +396,7 @@ static uint16_t get_num_parts(const std::string & etag)
 bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
 				const std::string & bucket_name,
 				MD5_Dict *p_etags_dict,
-				uint64_t *p_objs_cnt,
-				uint64_t *p_uniq_cnt)
+				stat_counters_t *p_stats)
 {
   uint64_t objs_cnt = 0;
   uint64_t uniq_cnt = 0;
@@ -394,48 +407,131 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
   while (has_more) {
     auto outcome = s3_client.ListObjects(request);
     if (!outcome.IsSuccess()) {
-      std::cerr << "Error: ListObjects: " << outcome.GetError().GetMessage() << std::endl;
+      std::cerr << "Error: ListObjects: "
+		<< outcome.GetError().GetMessage() << std::endl;
       return false;
     }
 
     auto & listing = outcome.GetResult();
     has_more = listing.GetIsTruncated();
-    Aws::Vector<Aws::S3::Model::Object> objects = listing.GetContents();
-    //std::cout << "Page #" << page_num << " has " << objects.size() << " objects, objs_cnt = " << objs_cnt << std::endl;
+    const Aws::Vector<Aws::S3::Model::Object>& objects = listing.GetContents();
     auto nextMarker = listing.GetNextMarker();
     request.SetMarker(nextMarker);
 
     char buff[64];
-    for (Aws::S3::Model::Object &object: objects) {
-      {
-	objs_cnt ++;
-	const auto   & etag      = object.GetETag();
-	// on disk allocation is done in 4KB units
-	// round up to find the on-disk space used by the object
-	const uint32_t size      = div_up(object.GetSize(), 4*1024);
-	const uint16_t num_parts = get_num_parts(etag);
+    for (const Aws::S3::Model::Object &object: objects) {
+      objs_cnt ++;
+      const auto   & etag      = object.GetETag();
+      // on disk allocation is done in 4KB units
+      // round up to find the on-disk space used by the object
+      const uint32_t size      = div_up(object.GetSize(), 4*1024);
+      const uint16_t num_parts = get_num_parts(etag);
 
-	const unsigned nbytes    = etag.copy(buff, 32, 1);
-	const uint64_t high      = hex2int(buff, buff+16);
-	const uint64_t low       = hex2int(buff+16, buff+32);
-	Key key = {high, low, size, num_parts, 0};
-	std::unique_lock<std::mutex> lock(dict_mtx);
-	auto itr = p_etags_dict->find(key);
-	if (itr == p_etags_dict->end()) {
-	  (*p_etags_dict)[key] = 1;
-	  uniq_cnt ++;
-	}
-	else {
-	  itr->second ++;
-	}
+      const unsigned nbytes    = etag.copy(buff, 32, 1);
+      const uint64_t high      = hex2int(buff, buff+16);
+      const uint64_t low       = hex2int(buff+16, buff+32);
+      Key key = {high, low, size, num_parts, 0};
+      std::unique_lock<std::mutex> lock(dict_mtx);
+      auto itr = p_etags_dict->find(key);
+      if (itr == p_etags_dict->end()) {
+	(*p_etags_dict)[key] = 1;
+	uniq_cnt ++;
+      }
+      else {
+	itr->second ++;
       }
     }
 
     page_num++;
   }
 
-  *p_objs_cnt += objs_cnt;
-  *p_uniq_cnt += uniq_cnt;
+  p_stats->objs_cnt += objs_cnt;
+  p_stats->uniq_cnt += uniq_cnt;
+  return true;
+}
+
+//---------------------------------------------------------------------------
+bool list_objects_versions_single_bucket(Aws::S3::S3Client & s3_client,
+					 const std::string & bucket_name,
+					 MD5_Dict *p_etags_dict,
+					 stat_counters_t *p_stats)
+{
+  uint64_t dels_cnt = 0;
+  uint64_t vers_cnt = 0;
+  uint64_t objs_cnt = 0;
+  uint64_t uniq_cnt = 0;
+  Aws::S3::Model::ListObjectVersionsRequest request;
+  request.WithBucket(bucket_name);
+
+  string   prev_key;
+  unsigned page_num = 0;
+  bool     has_more = true;
+  while (has_more) {
+    //request.SetMaxKeys(4);
+    auto outcome = s3_client.ListObjectVersions(request);
+    if (!outcome.IsSuccess()) {
+      std::cerr << "Error: ListObjects: "
+		<< outcome.GetError().GetMessage() << std::endl;
+      return false;
+    }
+
+    auto & listing = outcome.GetResult();
+    const Aws::Vector<Aws::S3::Model::ObjectVersion>& objects = listing.GetVersions();
+    has_more = listing.GetIsTruncated();
+
+    auto nextMarker = listing.GetNextKeyMarker();
+    request.SetKeyMarker(nextMarker);
+    auto nextVerMarker = listing.GetNextVersionIdMarker();
+    request.SetVersionIdMarker(nextVerMarker);
+
+#if 0
+    std::cout << "\nPage #" << page_num << "::obj count=" << objects.size()
+	      << ", markers are " << nextMarker << "||" << nextVerMarker << std::endl;
+#endif
+    dels_cnt += listing.GetDeleteMarkers().size();
+
+    char buff[64];
+    for (const Aws::S3::Model::ObjectVersion &object: objects) {
+      objs_cnt ++;
+      if (object.GetKey() == prev_key) {
+	vers_cnt++;
+      }
+      else {
+	prev_key = object.GetKey();
+      }
+#if 0
+      std::cout << object.GetKey() << "::" << object.GetVersionId()
+		<< "::ETag=" << object.GetETag() << std::endl;
+#endif
+      const auto   & etag      = object.GetETag();
+      // on disk allocation is done in 4KB units
+      // round up to find the on-disk space used by the object
+      const uint32_t size      = div_up(object.GetSize(), 4*1024);
+      const uint16_t num_parts = get_num_parts(etag);
+
+      const unsigned nbytes    = etag.copy(buff, 32, 1);
+      const uint64_t high      = hex2int(buff, buff+16);
+      const uint64_t low       = hex2int(buff+16, buff+32);
+      Key key = {high, low, size, num_parts, 0};
+      std::unique_lock<std::mutex> lock(dict_mtx);
+      auto itr = p_etags_dict->find(key);
+      if (itr == p_etags_dict->end()) {
+	(*p_etags_dict)[key] = 1;
+	uniq_cnt ++;
+      }
+      else {
+	itr->second ++;
+      }
+    }
+
+    page_num++;
+  }
+
+  p_stats->objs_cnt += objs_cnt;
+  p_stats->uniq_cnt += uniq_cnt;
+  p_stats->dels_cnt += dels_cnt;
+  p_stats->vers_cnt += vers_cnt;
+
   return true;
 }
 
@@ -462,14 +558,44 @@ static Aws::S3::S3Client* allocate_s3Client(const Aws::Client::ClientConfigurati
 }
 
 //---------------------------------------------------------------------------
+static bool is_versioning_enabled_bucket(Aws::S3::S3Client & s3_client,
+					 const std::string & bucket_name,
+					 bool verbose)
+{
+  Model::GetBucketVersioningRequest request;
+  request.WithBucket(bucket_name);
+  auto out = s3_client.GetBucketVersioning(request);
+  if (!out.IsSuccess()) {
+    std::cerr << "Error: ListObjects: " << out.GetError().GetMessage() << std::endl;
+    return false;
+  }
+  auto status = out.GetResult().GetStatus();
+  if (verbose) {
+    if (status == BucketVersioningStatus::NOT_SET) {
+      std::cout << bucket_name << "::versions NOT_SET" << std::endl;
+    }
+    else if (status == BucketVersioningStatus::Enabled) {
+      std::cout << bucket_name << "::versions Enabled" << std::endl;
+    }
+    else if (status == BucketVersioningStatus::Suspended) {
+      std::cout << bucket_name << "::versions Suspended" << std::endl;
+    }
+    else {
+      std::cerr << bucket_name << "::bad version status" << std::endl;
+    }
+  }
+
+  return (status == BucketVersioningStatus::Enabled);
+}
+
+//---------------------------------------------------------------------------
 bool ListObjects(const Aws::Client::ClientConfiguration &clientConfig,
 		 const params_t &params,
 		 const std::vector<std::string> & bucket_names,
 		 unsigned thread_id,
 		 unsigned threads_count,
 		 MD5_Dict *p_etags_dict,
-		 uint64_t *p_objs_cnt,
-		 uint64_t *p_uniq_cnt)
+		 stat_counters_t *p_stats)
 {
   Aws::S3::S3Client *p_s3Client = allocate_s3Client(clientConfig, params);
   if (p_s3Client) {
@@ -478,7 +604,15 @@ bool ListObjects(const Aws::Client::ClientConfiguration &clientConfig,
 	std::unique_lock<std::mutex> lock(print_mtx);
 	std::cout << "Thread: " << thread_id << " processing bucket: " << bucket_names[idx] << std::endl;
 	lock.unlock();
-	bool success = list_objects_single_bucket(*p_s3Client, bucket_names[idx], p_etags_dict, p_objs_cnt, p_uniq_cnt);
+	bool success;
+	if (is_versioning_enabled_bucket(*p_s3Client, bucket_names[idx], true) ) {
+	  success = list_objects_versions_single_bucket(*p_s3Client, bucket_names[idx],
+							p_etags_dict, p_stats);
+	}
+	else {
+	  success = list_objects_single_bucket(*p_s3Client, bucket_names[idx],
+					       p_etags_dict, p_stats);
+	}
 	if (!success) {
 	  return false;
 	}
@@ -703,15 +837,19 @@ int main(int argc, const char **argv)
   cout << params << std::endl;
   unsigned thread_count = params.threads_count;
   uint64_t objs_cnt = 0, uniq_cnt = 0;
+  uint64_t dels_cnt = 0, vers_cnt = 0;
+
   MD5_Dict etags_dict;
 
   std::thread* thread_arr[thread_count];
-  uint64_t objs_cnt_arr[thread_count];
-  uint64_t uniq_cnt_arr[thread_count];
+  stat_counters_t stats_arr[thread_count];
+  //uint64_t objs_cnt_arr[thread_count];
+  //uint64_t uniq_cnt_arr[thread_count];
 
   memset(thread_arr, 0, sizeof(thread_arr));
-  memset(objs_cnt_arr, 0, sizeof(objs_cnt_arr));
-  memset(uniq_cnt_arr, 0, sizeof(uniq_cnt_arr));
+  memset(stats_arr, 0, sizeof(stats_arr));
+  //memset(objs_cnt_arr, 0, sizeof(objs_cnt_arr));
+  //memset(uniq_cnt_arr, 0, sizeof(uniq_cnt_arr));
 
   unsigned thread_id = 0;
   std::vector<std::string> bucket_names;
@@ -751,8 +889,8 @@ int main(int argc, const char **argv)
   unsigned max_thread = std::min(thread_count, num_buckets);
   std::cout << "thread_count = " << thread_count << ", Actual Thread_COUNT = " << max_thread << std::endl;
   for (thread_id = 0; thread_id < max_thread; thread_id++) {
-    thread_arr[thread_id] = new std::thread(ListObjects, clientConfig, params, bucket_names, thread_id, max_thread,
-					    &etags_dict, objs_cnt_arr+thread_id, uniq_cnt_arr+thread_id);
+    thread_arr[thread_id] = new std::thread(ListObjects, clientConfig, params, bucket_names, thread_id,
+					    max_thread, &etags_dict, stats_arr+thread_id);
   }
 
   for( int id = 0; id < thread_id; id ++ ) {
@@ -764,12 +902,20 @@ int main(int argc, const char **argv)
     }
   }
   for (int id = 0; id < thread_id; id ++ ) {
-    objs_cnt += objs_cnt_arr[id];
-    uniq_cnt += uniq_cnt_arr[id];
+    objs_cnt += stats_arr[id].objs_cnt;
+    uniq_cnt += stats_arr[id].uniq_cnt;
+    dels_cnt += stats_arr[id].dels_cnt;
+    vers_cnt += stats_arr[id].vers_cnt;
   }
   std::cout << "===========================================================================\n" << std::endl;
   std::cout << "bucket count: " << num_buckets << ", total objects: " << objs_cnt << std::endl;
   std::cout << "We had " << uniq_cnt << " unique keys from a total of " << objs_cnt << " keys" << std::endl;
+  if (dels_cnt) {
+    std::cout << "We had " << dels_cnt << " deleted objs" << std::endl;
+  }
+  if (vers_cnt) {
+    std::cout << "We had " << vers_cnt << " older objs versions" << std::endl;
+  }
   print_report(etags_dict);
 
   Aws::ShutdownAPI(options); // Should only be called once.
