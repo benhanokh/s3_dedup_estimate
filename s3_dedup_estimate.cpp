@@ -410,12 +410,12 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
   while (has_more) {
     auto outcome = s3_client.ListObjects(request);
     if (!outcome.IsSuccess()) {
-      std::cerr << "retry: " << __func__ << ": "
+      std::cerr << bucket_name << " retry: " << __func__ << ": "
 		<< outcome.GetError().GetMessage() << std::endl;
       // retry one time
       outcome = s3_client.ListObjects(request);
       if (!outcome.IsSuccess()) {
-	std::cerr << "Error: " << __func__ << ": "
+	std::cerr << bucket_name << " Error: " << __func__ << ": "
 		  << outcome.GetError().GetMessage() << std::endl;
 	return false;
       }
@@ -479,12 +479,12 @@ bool list_objects_versions_single_bucket(Aws::S3::S3Client & s3_client,
     //request.SetMaxKeys(4);
     auto outcome = s3_client.ListObjectVersions(request);
     if (!outcome.IsSuccess()) {
-      std::cerr << "retry: " << __func__ << ": "
+      std::cerr << bucket_name << " retry: " << __func__ << ": "
 		<< outcome.GetError().GetMessage() << std::endl;
       // retry one time
       outcome = s3_client.ListObjectVersions(request);
       if (!outcome.IsSuccess()) {
-	std::cerr << "Error: " << __func__ << ": "
+	std::cerr << bucket_name << " Error: " << __func__ << ": "
 		  << outcome.GetError().GetMessage() << std::endl;
 	return false;
       }
