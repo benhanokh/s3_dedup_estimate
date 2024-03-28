@@ -54,6 +54,9 @@ struct stat_counters_t {
   uint64_t dels_cnt = 0;
   // counter for old versions of existing objects
   uint64_t vers_cnt = 0;
+
+  // counter for buckets who failed to list
+  uint32_t bad_bucket_cnt = 0;
 };
 
 struct params_t {
@@ -407,9 +410,15 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
   while (has_more) {
     auto outcome = s3_client.ListObjects(request);
     if (!outcome.IsSuccess()) {
-      std::cerr << "Error: ListObjects: "
+      std::cerr << "retry: " << __func__ << ": "
 		<< outcome.GetError().GetMessage() << std::endl;
-      return false;
+      // retry one time
+      outcome = s3_client.ListObjects(request);
+      if (!outcome.IsSuccess()) {
+	std::cerr << "Error: " << __func__ << ": "
+		  << outcome.GetError().GetMessage() << std::endl;
+	return false;
+      }
     }
 
     auto & listing = outcome.GetResult();
@@ -470,9 +479,15 @@ bool list_objects_versions_single_bucket(Aws::S3::S3Client & s3_client,
     //request.SetMaxKeys(4);
     auto outcome = s3_client.ListObjectVersions(request);
     if (!outcome.IsSuccess()) {
-      std::cerr << "Error: ListObjects: "
+      std::cerr << "retry: " << __func__ << ": "
 		<< outcome.GetError().GetMessage() << std::endl;
-      return false;
+      // retry one time
+      outcome = s3_client.ListObjectVersions(request);
+      if (!outcome.IsSuccess()) {
+	std::cerr << "Error: " << __func__ << ": "
+		  << outcome.GetError().GetMessage() << std::endl;
+	return false;
+      }
     }
 
     auto & listing = outcome.GetResult();
@@ -566,13 +581,14 @@ static bool is_versioning_enabled_bucket(Aws::S3::S3Client & s3_client,
   request.WithBucket(bucket_name);
   auto out = s3_client.GetBucketVersioning(request);
   if (!out.IsSuccess()) {
-    std::cerr << "Error: ListObjects: " << out.GetError().GetMessage() << std::endl;
+    std::cerr << "Error: " << __func__ << ": "
+	      << out.GetError().GetMessage() << std::endl;
     return false;
   }
   auto status = out.GetResult().GetStatus();
   if (verbose) {
     if (status == BucketVersioningStatus::NOT_SET) {
-      std::cout << bucket_name << "::versions NOT_SET" << std::endl;
+      //std::cout << bucket_name << "::versions NOT_SET" << std::endl;
     }
     else if (status == BucketVersioningStatus::Enabled) {
       std::cout << bucket_name << "::versions Enabled" << std::endl;
@@ -614,7 +630,7 @@ bool ListObjects(const Aws::Client::ClientConfiguration &clientConfig,
 					       p_etags_dict, p_stats);
 	}
 	if (!success) {
-	  return false;
+	  p_stats->bad_bucket_cnt++;
 	}
       }
     }
@@ -729,7 +745,7 @@ static const char* get_argv_string(const char **argv, unsigned idx)
 //---------------------------------------------------------------------------
 static int validate_endpoint(const char *endpoint)
 {
-  const char *http_prefix = "http://";
+  const char *http_prefix = "http";
   int ret = strncmp( http_prefix, endpoint, strlen(http_prefix));
   if (ret != 0) {
     std::cerr << "endpoint url must start with an 'http://' prefix" << std::endl;
@@ -838,7 +854,7 @@ int main(int argc, const char **argv)
   unsigned thread_count = params.threads_count;
   uint64_t objs_cnt = 0, uniq_cnt = 0;
   uint64_t dels_cnt = 0, vers_cnt = 0;
-
+  uint32_t bad_bucket_cnt = 0;
   MD5_Dict etags_dict;
 
   std::thread* thread_arr[thread_count];
@@ -906,8 +922,13 @@ int main(int argc, const char **argv)
     uniq_cnt += stats_arr[id].uniq_cnt;
     dels_cnt += stats_arr[id].dels_cnt;
     vers_cnt += stats_arr[id].vers_cnt;
+    bad_bucket_cnt += stats_arr[id].bad_bucket_cnt;
   }
   std::cout << "===========================================================================\n" << std::endl;
+  if (bad_bucket_cnt > 0) {
+    std::cerr << "Error: " << __func__ << ": We skipped "
+	      << bad_bucket_cnt << " bad buckets" << std::endl;
+  }
   std::cout << "bucket count: " << num_buckets << ", total objects: " << objs_cnt << std::endl;
   std::cout << "We had " << uniq_cnt << " unique keys from a total of " << objs_cnt << " keys" << std::endl;
   if (dels_cnt) {
