@@ -617,9 +617,11 @@ bool ListObjects(const Aws::Client::ClientConfiguration &clientConfig,
   if (p_s3Client) {
     for (unsigned idx = 0; idx < bucket_names.size(); idx++) {
       if ( idx % threads_count == thread_id) {
+#if 0
 	std::unique_lock<std::mutex> lock(print_mtx);
 	std::cout << "Thread: " << thread_id << " processing bucket: " << bucket_names[idx] << std::endl;
 	lock.unlock();
+#endif
 	bool success;
 	if (is_versioning_enabled_bucket(*p_s3Client, bucket_names[idx], true) ) {
 	  success = list_objects_versions_single_bucket(*p_s3Client, bucket_names[idx],
