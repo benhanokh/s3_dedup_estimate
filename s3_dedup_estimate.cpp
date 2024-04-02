@@ -90,7 +90,7 @@ struct Key
   friend std::ostream &operator<<(std::ostream &stream, const Key & k);
   uint64_t md5_high;   // High Bytes of the Object Data MD5
   uint64_t md5_low;    // Low  Bytes of the Object Data MD5
-  uint32_t obj_size;   // Object size in 4KB units (AWS MAX-SIZE is 5GB)
+  uint32_t obj_size;   // Object size in 4KB units max out at 16TB (AWS MAX-SIZE is 5TB)
   uint16_t num_parts;  // How many parts were used in multipart upload (AWS MAX-PART is 10,000)
   uint16_t pad16;      // Pad to get 8 Bytes alignment
 } __attribute__((__packed__));	// 24Bytes are 8Bytes aligned so should probably be packed already
@@ -138,7 +138,9 @@ struct arr_entry {
   arr_entry() {
     this->count    = 0;
     this->tot_size = 0;
-    this->min_size = 0xFFFFFFFF;
+    // set min_size to 8TB (aws max object size is 5TB)
+    // 8GB * 1K units = 8TB
+    this->min_size = 1ULL << 33;
     this->max_size = 0;
   }
 
@@ -167,16 +169,18 @@ struct arr_entry {
 
 private:
   uint32_t count;
+  uint64_t min_size;
+  uint64_t max_size;
   uint64_t tot_size;
-  uint32_t min_size;
-  uint32_t max_size;
 };
 
 std::ostream &operator<<(std::ostream& stream, const arr_entry& e)
 {
   if (e.get_count()) {
-    stream << "Min: " << e.min_size << " KiB, Max: " << e.max_size
-	   << " KiB, Avg: " << e.tot_size/e.get_count() << " KiB";
+    // on disk allocation is done in 4KB units
+    stream << "Min: " << e.min_size * 4 << " KiB, "
+	   << "Max: " << e.max_size * 4 << " KiB, "
+	   << "Avg: " << (e.tot_size* 4)/e.get_count() << " KiB";
   }
   else {
     stream << "Null object" << std::endl;
@@ -185,69 +189,17 @@ std::ostream &operator<<(std::ostream& stream, const arr_entry& e)
 }
 
 //==========================================================================
-class hashstreambuf : public std::streambuf {
-  unsigned      m_chunk_size;
-  unsigned      m_pos = 0;
-  uint64_t      m_fp_cnt = 0;
-  uint64_t      m_bytes  = 0;
-  char          m_buff[64*1024];
-  std::fstream *m_filep;
-public:
 
-  hashstreambuf(std::fstream *hashfile, unsigned chunk_size) : m_chunk_size(chunk_size), m_filep(hashfile) { }
-
-  void process_single_chunk(const char *p) {
-    std::string sv(p, m_chunk_size);
-    ByteBuffer  bb = HashingUtils::CalculateSHA1(sv);
-    m_filep->write((const char*)bb.GetUnderlyingData(), bb.GetLength());
-    m_fp_cnt++;
-    m_bytes += m_chunk_size;
-  }
-
-  std::streamsize xsputn (const char *p, const std::streamsize size) override {
-    //return size;
-    unsigned    n = size;
-    if (m_pos > 0) {
-      // we got leftover data
-      assert(m_pos < m_chunk_size);
-      unsigned missing_bytes = (m_chunk_size - m_pos);
-      if (n > missing_bytes) {
-	std::memcpy(m_buff+m_pos, p, missing_bytes);
-	process_single_chunk(m_buff);
-	m_pos = 0;
-	// skip past read data
-	p += missing_bytes;
-	n -= missing_bytes;
-      }
-    }
-
-    while (n >= m_chunk_size) {
-      process_single_chunk(p);
-      // skip past read data
-      p += m_chunk_size;
-      n -= m_chunk_size;
-    }
-
-    if (n > 0) {
-      // copy leftover data to buffer
-      std::memcpy(m_buff, p, n);
-      m_pos = n;
-    }
-
-    return size;
-  }
-};
-
-//==========================================================================
 //---------------------------------------------------------------------------
 static void print_report(const MD5_Dict &etags_dict)
 {
-  // on disk allocation is done in 4KB units
-  uint64_t duplicated_data_units = 0;
-  uint64_t unique_data_units     = 0;
-
-  uint64_t multipart_obj_count   = 0;
-  uint64_t single_part_obj_count = 0;
+  // on disk allocation is done in 4KB data units
+  uint64_t sp_duplicated_data_units = 0;
+  uint64_t mp_duplicated_data_units = 0;
+  uint64_t sp_unique_data_units     = 0;
+  uint64_t mp_unique_data_units     = 0;
+  uint64_t multipart_obj_count      = 0;
+  uint64_t single_part_obj_count    = 0;
 
   constexpr unsigned ARR_SIZE = (64*1024);
   std::array<arr_entry, ARR_SIZE+1> summery;
@@ -256,43 +208,64 @@ static void print_report(const MD5_Dict &etags_dict)
     const Key & key = entry.first;
     const unsigned count = entry.second;
     if (key.num_parts == 1) {
-      single_part_obj_count += count;
+      single_part_obj_count    += count;
+      sp_unique_data_units     += key.obj_size;
+      sp_duplicated_data_units += (count-1)*(key.obj_size);
     }
     else if (key.num_parts > 1) {
-      multipart_obj_count +=count;
+      multipart_obj_count      +=count;
+      mp_unique_data_units     += key.obj_size;
+      mp_duplicated_data_units += (count-1)*(key.obj_size);
     }
     else {
       std::cerr << "Bad Key with zero parts! " << key << std::endl;
     }
 
-    unique_data_units     += key.obj_size;
-    duplicated_data_units += (count-1)*(key.obj_size);
-
-    // on disk allocation is done in 4KB units
     if (count < ARR_SIZE) {
-      summery[count].add_entry(key.obj_size * 4);
+      summery[count].add_entry(key.obj_size);
     }
     else {
-      summery[ARR_SIZE].add_entry(key.obj_size * 4);
+      summery[ARR_SIZE].add_entry(key.obj_size);
     }
   }
 
-  if (unique_data_units == 0) {
+  if (mp_unique_data_units + sp_unique_data_units == 0) {
     std::cout << "We had a total of 0 KiB stored in the system" << std::endl;
     return;
   }
 
+  // on disk allocation is done in 4KB units
+  uint64_t sp_duplicated_data_kb = sp_duplicated_data_units * 4;
+  uint64_t sp_unique_data_kb     = sp_unique_data_units * 4;
+  uint64_t sp_total_size_kb      = sp_duplicated_data_kb + sp_unique_data_kb;
+
+  uint64_t mp_duplicated_data_kb = mp_duplicated_data_units * 4;
+  uint64_t mp_unique_data_kb     = mp_unique_data_units * 4;
+  uint64_t mp_total_size_kb      = mp_duplicated_data_kb + mp_unique_data_kb;
+
+  double   mp_space_precentage   = (double)mp_total_size_kb / (mp_total_size_kb + sp_total_size_kb);
   std::cout << "We had " << multipart_obj_count  << " multipart objects out of "
 	    << (multipart_obj_count + single_part_obj_count) << std::endl;
+  std::cout << "Multi-Part Objects consumes " << mp_space_precentage * 100
+	    << "% of the total storage space" << std::endl;
 
-  // on disk allocation is done in 4KB units
-  uint64_t duplicated_data_kb = duplicated_data_units * 4;
-  uint64_t unique_data_kb = unique_data_units * 4;
-  uint64_t total_size_kb = duplicated_data_kb + unique_data_kb;
-  std::cout << "We had a total of " << total_size_kb << " KiB stored in the system\n";
-  std::cout << "We had " << unique_data_kb << " Unique Data KiB stored in the system\n";
-  std::cout << "We had " << duplicated_data_kb << " Duplicated KiB Bytes stored in the system\n";
-  std::cout << "Dedup Ratio = " << (double)total_size_kb/(double)unique_data_kb << std::endl;
+  if (mp_unique_data_units) {
+    std::cout << "Multi-Part Objects had a total of " << mp_total_size_kb / (1024*1024) << " GiB stored in the system\n";
+    std::cout << "Multi-Part Objects had " << mp_unique_data_kb / (1024*1024) << " GiB of Unique Data stored in the system\n";
+    std::cout << "Multi-Part Objects had " << mp_duplicated_data_kb / (1024*1024) << " Duplicated GiB Bytes stored in the system\n";
+    std::cout << "Multi-Part Objects Dedup Ratio = " << (double)mp_total_size_kb/(double)mp_unique_data_kb << std::endl;
+  }
+
+  if (sp_unique_data_units) {
+    std::cout << "Single-Part Objects had a total of " << sp_total_size_kb / (1024*1024) << " GiB stored in the system\n";
+    std::cout << "Single-Part Objects had " << sp_unique_data_kb / (1024*1024) << " GiB of Unique Data stored in the system\n";
+    std::cout << "Single-Part Objects had " << sp_duplicated_data_kb / (1024*1024) << " Duplicated GiB Bytes stored in the system\n";
+    std::cout << "Single-Part Objects Dedup Ratio = " << (double)sp_total_size_kb/(double)sp_unique_data_kb << std::endl;
+  }
+
+  std::cout << "Combined Dedup Ratio = "
+	    << (double)(sp_total_size_kb+mp_total_size_kb)/(double)(sp_unique_data_kb+mp_unique_data_kb) << std::endl;
+
   std::cout << "===========================================================================\n" << std::endl;
   for (unsigned idx = 0; idx < ARR_SIZE; idx ++) {
     if (summery[idx].get_count() > 0){
