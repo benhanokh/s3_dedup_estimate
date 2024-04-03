@@ -30,6 +30,8 @@ options:
 	pass in a filename containing list of all allowed bucket names to process
    --thread-count=count
 	set the number of threads to run (default 4 threads)
+   --min-obj-size=size
+        set the size (KiB) of the smallest object to dedup (default 4KiB max 64KiB)
    --endpoint=url:port
 	set the endpoint url of the s3 gateway (default http://127.0.0.1:8000)
    --access-key=key
