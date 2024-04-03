@@ -66,7 +66,8 @@ struct params_t {
   const char* endpoint   = "http://127.0.0.1:8000"; // RGW default port
   const char* access_key = nullptr;
   const char* secret_key = nullptr;
-  int threads_count = 4;
+  int threads_count   = 4;
+  int min_obj_size_kb = 4;
 };
 
 std::ostream &operator<<(std::ostream &stream, const params_t & p)
@@ -81,6 +82,7 @@ std::ostream &operator<<(std::ostream &stream, const params_t & p)
   stream << "access_key=" << ((p.access_key == nullptr) ? "default" : p.access_key) << std::endl;
   stream << "secret_key=" << ((p.secret_key == nullptr) ? "default" : p.secret_key) << std::endl;
   stream << "threads_count=" << p.threads_count << std::endl;
+  stream << "min_obj_size_kb=" << p.min_obj_size_kb << std::endl;
   return stream;
 }
 
@@ -191,9 +193,47 @@ std::ostream &operator<<(std::ostream& stream, const arr_entry& e)
 //==========================================================================
 
 //---------------------------------------------------------------------------
-static void print_report(const MD5_Dict &etags_dict)
+static void print_short_summery(const char *s,
+				uint64_t total_size_kb,
+				uint64_t unique_data_kb,
+				uint64_t duplicated_data_kb)
+{
+  uint64_t size_kb = std::min(unique_data_kb, duplicated_data_kb);
+  const char *p_units = " KiB";
+  uint32_t div = 1;
+  if (size_kb > 1024*1024*1024) {
+    p_units = " TiB";
+    div = 1024*1024*1024;
+  }
+  else if (size_kb > 1024*1024) {
+    p_units = " GiB";
+    div = 1024*1024;
+  }
+  else if (size_kb > 1024) {
+    p_units = " MiB";
+    div = 1024;
+  }
+
+  std::cout << s << " Objects had a total of "
+	    << (double)total_size_kb / div << p_units
+	    << " stored in the system\n";
+  std::cout << s << " Objects had "
+	    << (double)unique_data_kb / div << p_units
+	    << " of Unique Data stored in the system\n";
+  std::cout << s << " Objects had "
+	    << (double)duplicated_data_kb / div << p_units
+	    << " of Duplicated data stored in the system\n";
+  std::cout << s << " Objects Dedup Ratio = "
+	    << (double)total_size_kb/(double)unique_data_kb << std::endl;
+}
+
+//---------------------------------------------------------------------------
+static void print_report(const MD5_Dict &etags_dict, uint32_t min_size_kb)
 {
   // on disk allocation is done in 4KB data units
+  uint64_t min_size_units = min_size_kb / 4;
+  uint64_t skipped_small_objs_count = 0;
+  uint64_t skipped_small_objs_size  = 0;
   uint64_t sp_duplicated_data_units = 0;
   uint64_t mp_duplicated_data_units = 0;
   uint64_t sp_unique_data_units     = 0;
@@ -207,6 +247,11 @@ static void print_report(const MD5_Dict &etags_dict)
   for (auto const& entry : etags_dict) {
     const Key & key = entry.first;
     const unsigned count = entry.second;
+    if (key.obj_size < min_size_units) {
+      skipped_small_objs_count += count;
+      skipped_small_objs_size += (key.obj_size * count) * 4;
+      continue;
+    }
     if (key.num_parts == 1) {
       single_part_obj_count    += count;
       sp_unique_data_units     += key.obj_size;
@@ -243,24 +288,23 @@ static void print_report(const MD5_Dict &etags_dict)
   uint64_t mp_unique_data_kb     = mp_unique_data_units * 4;
   uint64_t mp_total_size_kb      = mp_duplicated_data_kb + mp_unique_data_kb;
 
+  if (skipped_small_objs_count) {
+    std::cout << "We skipped " << skipped_small_objs_count << " objects smaller than " << min_size_kb << " KiB\n";
+    std::cout << "Aggregated size of skipped small objects is " << skipped_small_objs_size << " KiB\n";
+  }
+
   double   mp_space_precentage   = (double)mp_total_size_kb / (mp_total_size_kb + sp_total_size_kb);
-  std::cout << "We had " << multipart_obj_count  << " multipart objects out of "
-	    << (multipart_obj_count + single_part_obj_count) << std::endl;
+  std::cout << "We had " << multipart_obj_count  << " multipart objects and "
+	    << single_part_obj_count << " single-part objects" << std::endl;
   std::cout << "Multi-Part Objects consumes " << mp_space_precentage * 100
 	    << "% of the total storage space" << std::endl;
 
   if (mp_unique_data_units) {
-    std::cout << "Multi-Part Objects had a total of " << mp_total_size_kb / (1024*1024) << " GiB stored in the system\n";
-    std::cout << "Multi-Part Objects had " << mp_unique_data_kb / (1024*1024) << " GiB of Unique Data stored in the system\n";
-    std::cout << "Multi-Part Objects had " << mp_duplicated_data_kb / (1024*1024) << " Duplicated GiB Bytes stored in the system\n";
-    std::cout << "Multi-Part Objects Dedup Ratio = " << (double)mp_total_size_kb/(double)mp_unique_data_kb << std::endl;
+    print_short_summery("Multi-Part", mp_total_size_kb, mp_unique_data_kb, mp_duplicated_data_kb);
   }
 
   if (sp_unique_data_units) {
-    std::cout << "Single-Part Objects had a total of " << sp_total_size_kb / (1024*1024) << " GiB stored in the system\n";
-    std::cout << "Single-Part Objects had " << sp_unique_data_kb / (1024*1024) << " GiB of Unique Data stored in the system\n";
-    std::cout << "Single-Part Objects had " << sp_duplicated_data_kb / (1024*1024) << " Duplicated GiB Bytes stored in the system\n";
-    std::cout << "Single-Part Objects Dedup Ratio = " << (double)sp_total_size_kb/(double)sp_unique_data_kb << std::endl;
+    print_short_summery("Single-Part", sp_total_size_kb, sp_unique_data_kb, sp_duplicated_data_kb);
   }
 
   std::cout << "Combined Dedup Ratio = "
@@ -753,6 +797,8 @@ int usage(const char **argv)
     "        pass in a filename containing list of all allowed bucket names to process\n"
     "   --thread-count=count\n"
     "        set the number of threads to run (default 4 threads)\n"
+    "   --min-obj-size=size\n"
+    "        set the size (KiB) of the smallest object to dedup (default 4KiB max 64KiB)\n"
     "   --endpoint=url:port\n"
     "        set the endpoint url of the s3 gateway (default http://127.0.0.1:8000)\n"
     "   --access-key=key\n"
@@ -766,8 +812,10 @@ int usage(const char **argv)
 //---------------------------------------------------------------------------
 static int check_argv(int argc, const char **argv, struct params_t *params)
 {
-  constexpr unsigned THREAD_COUNT_MAX = 32; // no more than 32 threads
-
+  // no more than 32 threads
+  constexpr unsigned THREAD_COUNT_MAX = 32;
+  // the MIN OBJ size can't be set higher than 64KB
+  constexpr unsigned MIN_OBJ_SIZE_CEILING = 64;
   for (int i = 1; i < argc; i++) {
     if (argv_name_is(argv, i, "--help")) {
       return -1;
@@ -775,6 +823,13 @@ static int check_argv(int argc, const char **argv, struct params_t *params)
     else if (argv_name_is(argv, i, "--thread-count")) {
       params->threads_count = get_argv_val(argv, i, THREAD_COUNT_MAX);
       if (params->threads_count <= 0) {
+	return -1;
+      }
+    }
+    else if (argv_name_is(argv, i, "--min-obj-size")) {
+      params->min_obj_size_kb = get_argv_val(argv, i, MIN_OBJ_SIZE_CEILING);
+      // don't set MIN OBJ size lower than 4KB
+      if (params->min_obj_size_kb < 4) {
 	return -1;
       }
     }
@@ -912,7 +967,7 @@ int main(int argc, const char **argv)
   if (vers_cnt) {
     std::cout << "We had " << vers_cnt << " older objs versions" << std::endl;
   }
-  print_report(etags_dict);
+  print_report(etags_dict, params.min_obj_size_kb);
 
   Aws::ShutdownAPI(options); // Should only be called once.
   return 0;
