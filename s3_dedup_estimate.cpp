@@ -225,6 +225,7 @@ static void print_short_summery(const char *s,
 	    << " of Duplicated data stored in the system\n";
   std::cout << s << " Objects Dedup Ratio = "
 	    << (double)total_size_kb/(double)unique_data_kb << std::endl;
+  std::cout << std::endl;
 }
 
 //---------------------------------------------------------------------------
@@ -232,6 +233,13 @@ static void print_report(const MD5_Dict &etags_dict, uint32_t min_size_kb)
 {
   // on disk allocation is done in 4KB data units
   uint64_t min_size_units = min_size_kb / 4;
+  uint64_t _4MB_units      = 1024; // 1K units of 4KB equals _4MB
+  uint64_t _4MB_obj_count             = 0;
+  uint64_t smaller_than_4MB_count     = 0;
+  uint64_t _4MB_unique_data_units     = 0;
+  uint64_t _4MB_duplicated_data_units = 0;
+  uint64_t _4MB_obj_data_units        = 0;
+
   uint64_t skipped_small_objs_count = 0;
   uint64_t skipped_small_objs_size  = 0;
   uint64_t sp_duplicated_data_units = 0;
@@ -241,12 +249,26 @@ static void print_report(const MD5_Dict &etags_dict, uint32_t min_size_kb)
   uint64_t multipart_obj_count      = 0;
   uint64_t single_part_obj_count    = 0;
 
+
   constexpr unsigned ARR_SIZE = (64*1024);
   std::array<arr_entry, ARR_SIZE+1> summery;
 
   for (auto const& entry : etags_dict) {
     const Key & key = entry.first;
     const unsigned count = entry.second;
+
+    if (key.obj_size > _4MB_units) {
+      _4MB_obj_count             += count;
+      // we maintain the base-object + the first 4MB (head) of each object
+      _4MB_unique_data_units     += key.obj_size + ((count-1) * _4MB_units);
+      // we remove everything past the first 4MB from the duplicates
+      _4MB_duplicated_data_units += (count-1)*(key.obj_size - _4MB_units);
+    }
+    else {
+      smaller_than_4MB_count     += count;
+      _4MB_unique_data_units     += (count * key.obj_size);
+    }
+
     if (key.obj_size < min_size_units) {
       skipped_small_objs_count += count;
       skipped_small_objs_size += (key.obj_size * count) * 4;
@@ -280,6 +302,10 @@ static void print_report(const MD5_Dict &etags_dict, uint32_t min_size_kb)
   }
 
   // on disk allocation is done in 4KB units
+  uint64_t _4MB_duplicated_data_kb = _4MB_duplicated_data_units * 4;
+  uint64_t _4MB_unique_data_kb     = _4MB_unique_data_units * 4;
+  uint64_t _4MB_total_size_kb      = _4MB_duplicated_data_kb + _4MB_unique_data_kb;
+
   uint64_t sp_duplicated_data_kb = sp_duplicated_data_units * 4;
   uint64_t sp_unique_data_kb     = sp_unique_data_units * 4;
   uint64_t sp_total_size_kb      = sp_duplicated_data_kb + sp_unique_data_kb;
@@ -298,6 +324,12 @@ static void print_report(const MD5_Dict &etags_dict, uint32_t min_size_kb)
 	    << single_part_obj_count << " single-part objects" << std::endl;
   std::cout << "Multi-Part Objects consumes " << mp_space_precentage * 100
 	    << "% of the total storage space" << std::endl;
+  std::cout << "We had " << _4MB_obj_count << " objects bigger than 4MB and "
+	    << smaller_than_4MB_count << " smaller/equal\n" << std::endl;
+
+  if (_4MB_unique_data_units) {
+    print_short_summery("Tail Objects Dedup:", _4MB_total_size_kb, _4MB_unique_data_kb, _4MB_duplicated_data_kb);
+  }
 
   if (mp_unique_data_units) {
     print_short_summery("Multi-Part", mp_total_size_kb, mp_unique_data_kb, mp_duplicated_data_kb);
@@ -798,7 +830,7 @@ int usage(const char **argv)
     "   --thread-count=count\n"
     "        set the number of threads to run (default 4 threads)\n"
     "   --min-obj-size=size\n"
-    "        set the size (KiB) of the smallest object to dedup (default 4KiB max 64KiB)\n"
+    "        set the size (KiB) of the smallest object to dedup (default 4KiB max 4096KiB)\n"
     "   --endpoint=url:port\n"
     "        set the endpoint url of the s3 gateway (default http://127.0.0.1:8000)\n"
     "   --access-key=key\n"
@@ -814,8 +846,8 @@ static int check_argv(int argc, const char **argv, struct params_t *params)
 {
   // no more than 32 threads
   constexpr unsigned THREAD_COUNT_MAX = 32;
-  // the MIN OBJ size can't be set higher than 64KB
-  constexpr unsigned MIN_OBJ_SIZE_CEILING = 64;
+  // the MIN OBJ size can't be set higher than 4MB
+  constexpr unsigned MIN_OBJ_SIZE_CEILING = 4096;
   for (int i = 1; i < argc; i++) {
     if (argv_name_is(argv, i, "--help")) {
       return -1;
