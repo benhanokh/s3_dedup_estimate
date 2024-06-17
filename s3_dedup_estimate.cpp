@@ -26,6 +26,11 @@
 #include <mutex>
 #include <thread>
 
+#include <unistd.h>    /* standard unix functions, like getpid()         */
+#include <sys/types.h> /* various type definitions, like pid_t           */
+#include <signal.h>    /* signal name macros, and the signal() prototype */
+#include <pthread.h>
+#include <sys/syscall.h>
 
 using namespace Aws;
 using namespace Aws::Auth;
@@ -131,6 +136,61 @@ using MD5_Dict = std::unordered_map<struct Key, uint32_t, KeyHash, KeyEqual>;
 
 std::mutex dict_mtx;
 std::mutex print_mtx;
+std::mutex signal_mtx;
+bool signal_was_raised = false;
+bool report_was_published = false;
+
+unsigned main_thread_id = 0;
+unsigned num_buckets = 0;
+unsigned thread_count = 0;
+std::thread** thread_arr = nullptr;
+stat_counters_t* stats_arr = nullptr;
+bool* signal_arr = nullptr;
+
+//---------------------------------------------------------------------------
+static void shutdown_threads(std::thread* thread_arr[],
+			     const stat_counters_t stats_arr[],
+			     unsigned thread_count)
+{
+  if (syscall(SYS_gettid) == main_thread_id) {
+    for( int id = 0; id < thread_count; id ++ ) {
+      if( thread_arr[id] != nullptr ) {
+	//std::cout << "Join Thread-ID=" << id << " / " << thread_count << std::endl;
+	thread_arr[id]->join();
+	delete thread_arr[id];
+	thread_arr[id] =  nullptr;
+      }
+    }
+  }
+  else {
+    std::cout << __func__ << "::Terminate, System-Thread-ID = " << syscall(SYS_gettid) << std::endl;
+    return;
+  }
+  uint64_t objs_cnt = 0, uniq_cnt = 0;
+  uint64_t dels_cnt = 0, vers_cnt = 0;
+  uint32_t bad_bucket_cnt = 0;
+
+  for (int id = 0; id < thread_count; id ++ ) {
+    objs_cnt += stats_arr[id].objs_cnt;
+    uniq_cnt += stats_arr[id].uniq_cnt;
+    dels_cnt += stats_arr[id].dels_cnt;
+    vers_cnt += stats_arr[id].vers_cnt;
+    bad_bucket_cnt += stats_arr[id].bad_bucket_cnt;
+  }
+  std::cout << "===========================================================================\n" << std::endl;
+  if (bad_bucket_cnt > 0) {
+    std::cerr << "Error: " << __func__ << ": We skipped "
+	      << bad_bucket_cnt << " bad buckets" << std::endl;
+  }
+  std::cout << "bucket count: " << num_buckets << ", total objects: " << objs_cnt << std::endl;
+  std::cout << "We had " << uniq_cnt << " unique keys from a total of " << objs_cnt << " keys" << std::endl;
+  if (dels_cnt) {
+    std::cout << "We had " << dels_cnt << " deleted objs" << std::endl;
+  }
+  if (vers_cnt) {
+    std::cout << "We had " << vers_cnt << " older objs versions" << std::endl;
+  }
+}
 
 //==========================================================================
 struct arr_entry {
@@ -231,6 +291,16 @@ static void print_short_summery(const char *s,
 //---------------------------------------------------------------------------
 static void print_report(const MD5_Dict &etags_dict, uint32_t min_size_kb)
 {
+  // make sure the signal handler will invoke the print_report() only once!
+  {
+    std::unique_lock<std::mutex> lock(signal_mtx);
+    if (report_was_published == false) {
+      report_was_published = true;
+    }
+    else {
+      return;
+    }
+  }
   // on disk allocation is done in 4KB data units
   uint64_t min_size_units = min_size_kb / 4;
   uint64_t _4MB_units      = 1024; // 1K units of 4KB equals _4MB
@@ -320,10 +390,17 @@ static void print_report(const MD5_Dict &etags_dict, uint32_t min_size_kb)
   }
 
   double   mp_space_precentage   = (double)mp_total_size_kb / (mp_total_size_kb + sp_total_size_kb);
-  std::cout << "We had " << multipart_obj_count  << " multipart objects and "
-	    << single_part_obj_count << " single-part objects" << std::endl;
-  std::cout << "Multi-Part Objects consumes " << mp_space_precentage * 100
-	    << "% of the total storage space" << std::endl;
+  if (multipart_obj_count) {
+    std::cout << "We had " << multipart_obj_count  << " multipart objects and ";
+  }
+  else {
+    std::cout << "We had ";
+  }
+  std::cout << single_part_obj_count << " single-part objects" << std::endl;
+  if (mp_space_precentage) {
+    std::cout << "Multi-Part Objects consumes " << mp_space_precentage * 100
+	      << "% of the total storage space" << std::endl;
+  }
   std::cout << "We had " << _4MB_obj_count << " objects bigger than 4MB and "
 	    << smaller_than_4MB_count << " smaller/equal\n" << std::endl;
 
@@ -445,7 +522,8 @@ static uint16_t get_num_parts(const std::string & etag)
 }
 
 //---------------------------------------------------------------------------
-bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
+bool list_objects_single_bucket(unsigned thread_id,
+				Aws::S3::S3Client & s3_client,
 				const std::string & bucket_name,
 				MD5_Dict *p_etags_dict,
 				stat_counters_t *p_stats)
@@ -456,6 +534,7 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
   request.WithBucket(bucket_name);
   unsigned page_num = 0;
   bool     has_more = true;
+
   while (has_more) {
     auto outcome = s3_client.ListObjects(request);
     if (!outcome.IsSuccess()) {
@@ -479,6 +558,17 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
     char buff[64];
     for (const Aws::S3::Model::Object &object: objects) {
       objs_cnt ++;
+#if 0
+      if (objs_cnt == 7777) {
+	std::unique_lock<std::mutex> lock(signal_mtx);
+	if (signal_was_raised == false) {
+	  signal_was_raised = true;
+	  std::cout << __func__ << "::raise(SIGINT)" << std::endl;
+	  lock.unlock();
+	  raise(SIGINT);
+	}
+      }
+#endif
       const auto   & etag      = object.GetETag();
       // on disk allocation is done in 4KB units
       // round up to find the on-disk space used by the object
@@ -499,7 +589,10 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
 	itr->second ++;
       }
     }
-
+    if (signal_arr[thread_id]) {
+      std::cout << __func__ << "::Terminate Thread-ID = " << thread_id << std::endl;
+      break;
+    }
     page_num++;
   }
 
@@ -509,7 +602,8 @@ bool list_objects_single_bucket(Aws::S3::S3Client & s3_client,
 }
 
 //---------------------------------------------------------------------------
-bool list_objects_versions_single_bucket(Aws::S3::S3Client & s3_client,
+bool list_objects_versions_single_bucket(unsigned thread_id,
+					 Aws::S3::S3Client & s3_client,
 					 const std::string & bucket_name,
 					 MD5_Dict *p_etags_dict,
 					 stat_counters_t *p_stats)
@@ -587,7 +681,10 @@ bool list_objects_versions_single_bucket(Aws::S3::S3Client & s3_client,
 	itr->second ++;
       }
     }
-
+    if (signal_arr[thread_id]) {
+      std::cout << __func__ << "::Terminate Thread-ID = " << thread_id << std::endl;
+      break;
+    }
     page_num++;
   }
 
@@ -666,21 +763,28 @@ bool ListObjects(const Aws::Client::ClientConfiguration &clientConfig,
   if (p_s3Client) {
     for (unsigned idx = 0; idx < bucket_names.size(); idx++) {
       if ( idx % threads_count == thread_id) {
-#if 0
-	std::unique_lock<std::mutex> lock(print_mtx);
-	std::cout << "Thread: " << thread_id << " processing bucket: " << bucket_names[idx] << std::endl;
-	lock.unlock();
-#endif
+	if (signal_arr[thread_id]) {
+	  std::cout << __func__ << "::Terminate Thread-ID = " << thread_id << std::endl;
+	  break;
+	}
 	bool success;
 	if (is_versioning_enabled_bucket(*p_s3Client, bucket_names[idx], true) ) {
-	  success = list_objects_versions_single_bucket(*p_s3Client, bucket_names[idx],
+	  success = list_objects_versions_single_bucket(thread_id, *p_s3Client, bucket_names[idx],
 							p_etags_dict, p_stats);
 	}
 	else {
-	  success = list_objects_single_bucket(*p_s3Client, bucket_names[idx],
+	  success = list_objects_single_bucket(thread_id, *p_s3Client, bucket_names[idx],
 					       p_etags_dict, p_stats);
 	}
-	if (!success) {
+	if (success) {
+#if 1
+	  std::unique_lock<std::mutex> lock(print_mtx);
+	  std::cout << "Thread: " << thread_id << " finished processing bucket: " << bucket_names[idx]
+		    << ", aggreagted objs_cnt: " << p_stats->objs_cnt << std::endl;
+	  lock.unlock();
+#endif
+	}
+	else {
 	  p_stats->bad_bucket_cnt++;
 	}
       }
@@ -904,35 +1008,56 @@ static int check_argv(int argc, const char **argv, struct params_t *params)
   return 0;
 }
 
+MD5_Dict etags_dict;
+struct params_t params;
+
+//---------------------------------------------------------------------------
+static void catch_int(int sig_num)
+{
+  //std::cout << __func__ << "::System-Thread-ID = " << syscall(SYS_gettid) << " / " << main_thread_id << std::endl;
+  static bool first_time = true;
+  {
+    std::unique_lock<std::mutex> lock(signal_mtx);
+    if (first_time) {
+      /* re-set the signal handler again to catch_int, for next time */
+      signal(sig_num, catch_int);
+
+      //std::cout << "set signal_arr" << std::endl;
+      first_time = false;
+      for (int id = 0; id < thread_count; id ++ ) {
+	signal_arr[id] = true;
+      }
+    }
+  }
+
+  if (syscall(SYS_gettid) == main_thread_id) {
+    shutdown_threads(thread_arr, stats_arr, thread_count);
+    print_report(etags_dict, params.min_obj_size_kb);
+    exit(0);
+  }
+}
+
 //---------------------------------------------------------------------------
 int main(int argc, const char **argv)
 {
-  struct params_t params;
   if (check_argv(argc, argv, &params) != 0) {
     std::cerr << "failed check_argv" << std::endl;
     return usage(argv);
   }
   cout << params << std::endl;
-  unsigned thread_count = params.threads_count;
-  uint64_t objs_cnt = 0, uniq_cnt = 0;
-  uint64_t dels_cnt = 0, vers_cnt = 0;
-  uint32_t bad_bucket_cnt = 0;
-  MD5_Dict etags_dict;
+  //unsigned thread_count = params.threads_count;
+  unsigned req_thread_count = params.threads_count;
 
-  std::thread* thread_arr[thread_count];
-  stat_counters_t stats_arr[thread_count];
-  //uint64_t objs_cnt_arr[thread_count];
-  //uint64_t uniq_cnt_arr[thread_count];
-
-  memset(thread_arr, 0, sizeof(thread_arr));
-  memset(stats_arr, 0, sizeof(stats_arr));
-  //memset(objs_cnt_arr, 0, sizeof(objs_cnt_arr));
-  //memset(uniq_cnt_arr, 0, sizeof(uniq_cnt_arr));
+  main_thread_id = syscall(SYS_gettid);
+  stats_arr = new stat_counters_t[req_thread_count];
+  memset(stats_arr, 0, sizeof(stat_counters_t) * req_thread_count);
+  thread_arr = new std::thread*[req_thread_count];
+  memset(thread_arr, 0, sizeof(std::thread*) * req_thread_count);
+  signal_arr = new bool[req_thread_count];
+  memset(signal_arr, 0, sizeof(bool) * req_thread_count);
 
   unsigned thread_id = 0;
   std::vector<std::string> bucket_names;
-  unsigned num_buckets = 0;
-
   Aws::SDKOptions options;
   //options.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Debug;
   Aws::InitAPI(options); // Should only be called once.
@@ -947,9 +1072,6 @@ int main(int argc, const char **argv)
       Aws::ShutdownAPI(options); // Should only be called once.
       return -1;
     }
-
-    num_buckets = reply.GetResult().GetBuckets().size();
-
     for (auto &bucket: reply.GetResult().GetBuckets()) {
       //std::cout << "bucket = " << bucket.GetName() << std::endl;
       bucket_names.emplace_back(bucket.GetName());
@@ -964,41 +1086,18 @@ int main(int argc, const char **argv)
     return usage(argv);
   }
 
-  unsigned max_thread = std::min(thread_count, num_buckets);
-  std::cout << "thread_count = " << thread_count << ", Actual Thread_COUNT = " << max_thread << std::endl;
-  for (thread_id = 0; thread_id < max_thread; thread_id++) {
+  num_buckets = bucket_names.size();
+  thread_count = std::min(req_thread_count, num_buckets);
+  std::cout << "Requested thread_count = " << req_thread_count
+	    << ", actual thread_count = " << thread_count << std::endl;
+  for (thread_id = 0; thread_id < thread_count; thread_id++) {
     thread_arr[thread_id] = new std::thread(ListObjects, clientConfig, params, bucket_names, thread_id,
-					    max_thread, &etags_dict, stats_arr+thread_id);
+					    thread_count, &etags_dict, stats_arr+thread_id);
   }
-
-  for( int id = 0; id < thread_id; id ++ ) {
-    if( thread_arr[id] != nullptr ) {
-      //std::cout << "Join Thread-ID=" << id << std::endl;
-      thread_arr[id]->join();
-      delete thread_arr[id];
-      thread_arr[id] =  nullptr;
-    }
-  }
-  for (int id = 0; id < thread_id; id ++ ) {
-    objs_cnt += stats_arr[id].objs_cnt;
-    uniq_cnt += stats_arr[id].uniq_cnt;
-    dels_cnt += stats_arr[id].dels_cnt;
-    vers_cnt += stats_arr[id].vers_cnt;
-    bad_bucket_cnt += stats_arr[id].bad_bucket_cnt;
-  }
-  std::cout << "===========================================================================\n" << std::endl;
-  if (bad_bucket_cnt > 0) {
-    std::cerr << "Error: " << __func__ << ": We skipped "
-	      << bad_bucket_cnt << " bad buckets" << std::endl;
-  }
-  std::cout << "bucket count: " << num_buckets << ", total objects: " << objs_cnt << std::endl;
-  std::cout << "We had " << uniq_cnt << " unique keys from a total of " << objs_cnt << " keys" << std::endl;
-  if (dels_cnt) {
-    std::cout << "We had " << dels_cnt << " deleted objs" << std::endl;
-  }
-  if (vers_cnt) {
-    std::cout << "We had " << vers_cnt << " older objs versions" << std::endl;
-  }
+  /* set the INT (Ctrl-C) signal handler to 'catch_int' */
+  signal(SIGINT,  catch_int);
+  std::cout << "Setting signal handler" << std::endl;
+  shutdown_threads(thread_arr, stats_arr, thread_count);
   print_report(etags_dict, params.min_obj_size_kb);
 
   Aws::ShutdownAPI(options); // Should only be called once.
